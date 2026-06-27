@@ -214,25 +214,28 @@ def main():
     symbols = get_bitget_spot_symbols()
 
     ranked = []
-    candidate_map = {x.replace("USDT", ""): x for x in candidates}
+    
 
     for s in symbols:
         base = s.replace("_USDT", "").replace("USDT", "")
         # Scan semua pair USDT
-pass
+for s in symbols:
+    base = s.replace("_USDT", "").replace("USDT", "")
 
-        try:
-            item = analyze_symbol(s)
-            if not item:
-                continue
-            if item["volume_usdt"] < MIN_QUOTE_VOLUME_USDT:
-                continue
-            if item["score"] < MIN_SCORE:
-                continue
-            ranked.append(item)
-            time.sleep(0.2)
-        except Exception:
+    try:
+        item = analyze_symbol(s)
+        if not item:
             continue
+        if item["volume_usdt"] < MIN_QUOTE_VOLUME_USDT:
+            continue
+        if item["score"] < MIN_SCORE:
+            continue
+
+        ranked.append(item)
+        time.sleep(0.2)
+
+    except Exception:
+        continue
 
     ranked = sorted(ranked, key=lambda x: x["score"], reverse=True)[:LIMIT_TOP]
 
