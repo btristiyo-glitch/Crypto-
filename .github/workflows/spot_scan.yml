@@ -31,6 +31,5 @@ jobs:
           BITGET_API_PASSPHRASE: ${{ secrets.BITGET_API_PASSPHRASE }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python scanner.py
-          
+        run: python scanner.py
+        
