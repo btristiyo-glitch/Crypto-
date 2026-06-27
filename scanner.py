@@ -209,10 +209,8 @@ def analyze_symbol(symbol: str):
     }
 
 def main():
-    if not BITGET_API_KEY or not BITGET_API_SECRET or not BITGET_API_PASSPHRASE:
-        raise RuntimeError("Bitget API credentials belum di-set.")
-
-    candidates = load_trending_candidates()
+    
+    candidates = []
     symbols = get_bitget_spot_symbols()
 
     ranked = []
@@ -220,8 +218,8 @@ def main():
 
     for s in symbols:
         base = s.replace("_USDT", "").replace("USDT", "")
-        if candidates and base not in candidate_map and base not in candidates:
-            continue
+        # Scan semua pair USDT
+pass
 
         try:
             item = analyze_symbol(s)
