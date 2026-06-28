@@ -1,10 +1,8 @@
 import os
 import time
-import math
 import hmac
 import base64
 import hashlib
-import csv
 import logging
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -18,6 +16,8 @@ from ta.volatility import AverageTrueRange
 # ============================================================
 # CONFIG
 # ============================================================
+BASE_URL = "https://api.bitget.com"
+
 BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
 BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "")
@@ -25,17 +25,15 @@ BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-BASE_URL = "https://api.bitget.com"
-
 TIMEFRAME = "4H"
 CANDLE_LIMIT = 180
-TOP_N = 5
+TOP_N = 3
+MAX_SYMBOLS_PER_RUN = 150
 
 MIN_QUOTE_VOLUME_USDT = 500_000
 MIN_AVG_QUOTE_VOLUME_USDT = 300_000
-MIN_SCORE = 62
+MIN_SCORE = 66
 
-MAX_SYMBOLS_PER_RUN = 150
 SLEEP_BETWEEN_REQUESTS = 0.15
 REQUEST_TIMEOUT = 20
 
@@ -45,41 +43,36 @@ ALPHA_NUM_RESULTS = 15
 OUTPUT_DIR = "output"
 LOG_FILE = os.path.join(OUTPUT_DIR, "scanner.log")
 CSV_FILE = os.path.join(OUTPUT_DIR, "scan_results.csv")
+BLACKLIST_FILE = os.path.join(OUTPUT_DIR, "blacklist.csv")
 
 # ============================================================
-# LOGGING
+# SETUP
 # ============================================================
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
-console = logging.getLogger("scanner")
-
 
 def log(msg):
     print(msg)
     logging.info(msg)
-
 
 def log_err(msg):
     print(msg)
     logging.error(msg)
 
 # ============================================================
-# HELPERS
+# UTIL
 # ============================================================
 def utc_ms():
     return str(int(datetime.now(timezone.utc).timestamp() * 1000))
 
-
 def normalize_text(s):
     return (
-        str(s)
-        .upper()
+        str(s).upper()
         .replace("$", "")
         .replace(" ", "")
         .replace("-", "")
@@ -89,6 +82,14 @@ def normalize_text(s):
         .strip()
     )
 
+def similarity(a, b):
+    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 def sign(secret: str, timestamp: str, method: str, path: str, query: str = "", body: str = ""):
     payload = f"{timestamp}{method.upper()}{path}"
@@ -97,7 +98,6 @@ def sign(secret: str, timestamp: str, method: str, path: str, query: str = "", b
     payload += body
     digest = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest()
     return base64.b64encode(digest).decode()
-
 
 def get_headers(method: str, path: str, query: str = "", body: str = ""):
     ts = utc_ms()
@@ -111,25 +111,23 @@ def get_headers(method: str, path: str, query: str = "", body: str = ""):
         "locale": "en-US",
     }
 
-
 def http_get(url, params=None, headers=None):
     r = requests.get(url, params=params or {}, headers=headers or {}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-
 def bitget_public(path, params=None):
     return http_get(BASE_URL + path, params=params)
-
 
 def safe_telegram_send(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram disabled - token/chat_id not set.")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)]
 
+    ok = True
     for chunk in chunks:
         try:
             resp = requests.post(
@@ -143,16 +141,50 @@ def safe_telegram_send(text: str):
                 timeout=REQUEST_TIMEOUT,
             )
             if resp.status_code != 200:
+                ok = False
                 log_err(f"Telegram send failed: {resp.status_code} - {resp.text}")
         except Exception as e:
+            ok = False
             log_err(f"Telegram exception: {e}")
-
-
-def similarity(a, b):
-    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+    return ok
 
 # ============================================================
-# NARRATIVE SOURCES
+# BLACKLIST
+# ============================================================
+def load_blacklist():
+    if not os.path.exists(BLACKLIST_FILE):
+        return {}
+    try:
+        df = pd.read_csv(BLACKLIST_FILE)
+        if df.empty:
+            return {}
+        return {normalize_text(row["symbol"]): int(row["fail_count"]) for _, row in df.iterrows()}
+    except Exception as e:
+        log_err(f"Blacklist load error: {e}")
+        return {}
+
+def save_blacklist(data):
+    rows = [{"symbol": k, "fail_count": v} for k, v in data.items()]
+    pd.DataFrame(rows).to_csv(BLACKLIST_FILE, index=False)
+
+def update_blacklist(blacklist, symbol, success, max_fails=3):
+    key = normalize_text(symbol)
+    if success:
+        if key in blacklist:
+            blacklist[key] = max(0, blacklist[key] - 1)
+    else:
+        blacklist[key] = blacklist.get(key, 0) + 1
+
+    if blacklist.get(key, 0) < 1:
+        blacklist.pop(key, None)
+
+    save_blacklist(blacklist)
+
+def is_blacklisted(blacklist, symbol, max_fails=3):
+    return blacklist.get(normalize_text(symbol), 0) >= max_fails
+
+# ============================================================
+# NARRATIVE
 # ============================================================
 def load_alpha_and_trending_candidates():
     candidates = set()
@@ -169,13 +201,12 @@ def load_alpha_and_trending_candidates():
             market_segments=["layer1", "layer2", "crosschain", "defi", "stablecoins", "infrastructure", "developer tools", "ai agents", "payments wallets", "launchpads airdrops", "culture memecoins", "other"],
             engagement_levels=["medium", "high"],
         )
-
         for item in alpha.get("results", []):
             for key in ["project_name", "name", "ticker", "symbol"]:
                 val = item.get(key)
                 if val:
-                    meta["alpha_hits"].append(str(val))
                     candidates.add(normalize_text(val))
+                    meta["alpha_hits"].append(str(val))
     except Exception as e:
         log_err(f"Alpha error: {e}")
 
@@ -183,36 +214,31 @@ def load_alpha_and_trending_candidates():
         from functions import find_trending_coins
         trending = find_trending_coins()
         coins = trending.get("trending_coins", {}).get("trending_coins", [])
-
         for coin in coins:
             for key in ["symbol", "name"]:
                 val = coin.get(key)
                 if val:
-                    meta["trending_hits"].append(str(val))
                     candidates.add(normalize_text(val))
+                    meta["trending_hits"].append(str(val))
     except Exception as e:
-        log_err(f"Trending coins error: {e}")
+        log_err(f"Trending error: {e}")
 
-    candidates.discard("")
     return candidates, meta
 
 # ============================================================
-# BITGET UNIVERSE
+# UNIVERSE
 # ============================================================
 def get_bitget_spot_usdt_symbols():
     data = bitget_public("/api/v2/spot/public/symbols")
     items = data.get("data", [])
     out = []
-
     for x in items:
         symbol = x.get("symbol")
         quote = x.get("quoteCoin")
         status = x.get("status")
         if symbol and quote == "USDT" and status == "online":
             out.append(symbol)
-
     return sorted(list(set(out)))
-
 
 def build_symbol_maps(spot_symbols):
     norm_map = {}
@@ -222,15 +248,12 @@ def build_symbol_maps(spot_symbols):
         norm_map[normalize_text(s)] = s
     return norm_map
 
-
 def match_candidates_to_bitget(candidates, spot_map, spot_symbols):
     matched = set()
-
     for cand in candidates:
         if cand in spot_map:
             matched.add(spot_map[cand])
             continue
-
         best_sym = None
         best_score = 0.0
         for s in spot_symbols:
@@ -239,27 +262,18 @@ def match_candidates_to_bitget(candidates, spot_map, spot_symbols):
             if sc > best_score:
                 best_score = sc
                 best_sym = s
-
         if best_sym and best_score >= 0.72:
             matched.add(best_sym)
-
     return sorted(list(matched))
 
 # ============================================================
-# MARKET DATA
+# DATA
 # ============================================================
 def get_spot_candles(symbol, granularity="4H", limit=180):
-    # Bitget spot candles can reject unsupported granularity formats.
-    # We'll try a small set of safe fallbacks.
-    trial_granularities = [granularity, "4H", "1H", "15m"]
-
+    trial_granularities = [granularity, "1H", "15m"]
     for g in trial_granularities:
         try:
-            params = {
-                "symbol": symbol,
-                "granularity": g,
-                "limit": str(limit),
-            }
+            params = {"symbol": symbol, "granularity": g, "limit": str(limit)}
             data = bitget_public("/api/v2/spot/market/candles", params=params)
             rows = data.get("data", [])
             if rows:
@@ -268,16 +282,13 @@ def get_spot_candles(symbol, granularity="4H", limit=180):
                     df[col] = pd.to_numeric(df[col], errors="coerce")
                 df = df.dropna()
                 if not df.empty:
-                    df = df.sort_values("ts").reset_index(drop=True)
-                    return df
+                    return df.sort_values("ts").reset_index(drop=True)
         except Exception as e:
-            log_err(f"{symbol} candles failed on granularity {g}: {e}")
-            continue
-
+            log_err(f"{symbol} candles failed on {g}: {e}")
     return None
 
 # ============================================================
-# SCORING
+# STRATEGY
 # ============================================================
 def calc_levels(df):
     close = df["close"]
@@ -305,24 +316,19 @@ def calc_levels(df):
     stop = recent_low_20 * 0.985
     risk = max(entry - stop, float(atr) * 0.8)
 
-    tp1 = entry + risk * 1.5
-    tp2 = entry + risk * 2.5
-    tp3 = entry + risk * 3.5
-
     return {
         "last": last,
         "entry": round(float(entry), 8),
         "stop": round(float(stop), 8),
-        "tp1": round(float(tp1), 8),
-        "tp2": round(float(tp2), 8),
-        "tp3": round(float(tp3), 8),
+        "tp1": round(float(entry + risk * 1.5), 8),
+        "tp2": round(float(entry + risk * 2.5), 8),
+        "tp3": round(float(entry + risk * 3.5), 8),
         "atr": float(atr),
         "sma20": float(sma20) if pd.notna(sma20) else None,
         "sma50": float(sma50) if pd.notna(sma50) else None,
         "breakout": breakout,
         "uptrend": uptrend,
     }
-
 
 def score_symbol(df, narrative_hit=False):
     close = df["close"]
@@ -382,6 +388,15 @@ def score_symbol(df, narrative_hit=False):
     if vol20 > vol60 * 1.2:
         score += 4
 
+    # Cooldown chop filter
+    chop = False
+    if levels["sma20"] is not None and levels["sma50"] is not None:
+        close_crosses = ((close.tail(20) > levels["sma20"]) != (close.tail(20).shift(1) > levels["sma20"])).sum()
+        sma_gap = abs(levels["sma20"] - levels["sma50"]) / last
+        if close_crosses >= 6 and sma_gap < 0.01:
+            chop = True
+            score -= 12
+
     return {
         "score": round(score, 2),
         "rsi": round(rsi_last, 2),
@@ -390,8 +405,8 @@ def score_symbol(df, narrative_hit=False):
         "vol60": round(vol60, 2),
         "atr_pct": round(atr_pct, 4),
         "levels": levels,
+        "chop": chop,
     }
-
 
 def build_reason(item):
     parts = []
@@ -405,20 +420,55 @@ def build_reason(item):
         parts.append("MACD mendukung trend naik")
     if item["atr_pct"] >= 0.025:
         parts.append("range masih enak buat follow-through")
+    if item["chop"]:
+        parts.append("hindari - pasar terlalu chop")
     return " - ".join(parts)
-
 
 def build_signal_label(score):
     if score >= 75:
         return "🟢 BUY"
-    elif score >= 62:
+    if score >= 66:
         return "🟡 HOLD"
     return "🔴 SELL"
 
 # ============================================================
-# RUN
+# OUTPUT
+# ============================================================
+def save_csv(rows):
+    if not rows:
+        return None
+    pd.DataFrame(rows).to_csv(CSV_FILE, index=False)
+    return CSV_FILE
+
+def telegram_report(results, meta):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "🔥 *BITGET SPOT NARRATIVE SCANNER*",
+        f"🕒 {now_str}",
+        f"Alpha hits: {len(meta['alpha_hits'])} - Trending hits: {len(meta['trending_hits'])}",
+        "",
+    ]
+
+    if not results:
+        lines.append("Tidak ada setup valid hari ini.")
+        return "\n".join(lines)
+
+    for i, x in enumerate(results[:3], 1):
+        lines.append(
+            f"{i}. *{x['symbol']}* - {x['label']} - score {x['score']}\n"
+            f"Entry: {x['entry']} | SL: {x['stop']}\n"
+            f"TP1: {x['tp1']} | TP2: {x['tp2']} | TP3: {x['tp3']}\n"
+            f"RSI: {x['rsi']} | MACD: {x['macd_hist']} | Vol20: {x['vol20']}\n"
+            f"Thesis: {x['reason']}\n"
+        )
+    return "\n".join(lines)
+
+# ============================================================
+# MAIN
 # ============================================================
 def run_scan():
+    blacklist = load_blacklist()
+
     spot_symbols = get_bitget_spot_usdt_symbols()
     spot_map = build_symbol_maps(spot_symbols)
 
@@ -429,15 +479,17 @@ def run_scan():
         log("Tidak ada match alpha/trending - fallback ke full Bitget USDT scan.")
         matched = spot_symbols
 
+    matched = [s for s in matched if not is_blacklisted(blacklist, s)]
     matched = matched[:MAX_SYMBOLS_PER_RUN]
 
     results = []
-    rows_for_csv = []
+    csv_rows = []
 
     for symbol in matched:
         try:
             df = get_spot_candles(symbol, granularity=TIMEFRAME, limit=CANDLE_LIMIT)
             if df is None or len(df) < 60:
+                update_blacklist(blacklist, symbol, success=False)
                 continue
 
             base_symbol = normalize_text(symbol.replace("_USDT", ""))
@@ -445,11 +497,16 @@ def run_scan():
 
             metrics = score_symbol(df, narrative_hit=narrative_hit)
 
-            if metrics["vol20"] < MIN_QUOTE_VOLUME_USDT:
+            if metrics["vol20"] < MIN_QUOTE_VOLUME_USDT or metrics["vol60"] < MIN_AVG_QUOTE_VOLUME_USDT:
+                update_blacklist(blacklist, symbol, success=False)
                 continue
-            if metrics["vol60"] < MIN_AVG_QUOTE_VOLUME_USDT:
+
+            if metrics["chop"]:
+                update_blacklist(blacklist, symbol, success=False)
                 continue
+
             if metrics["score"] < MIN_SCORE:
+                update_blacklist(blacklist, symbol, success=False)
                 continue
 
             levels = metrics["levels"]
@@ -477,63 +534,35 @@ def run_scan():
             }
 
             results.append(row)
-            rows_for_csv.append(row)
+            csv_rows.append(row)
+            update_blacklist(blacklist, symbol, success=True)
             time.sleep(SLEEP_BETWEEN_REQUESTS)
 
         except Exception as e:
             log_err(f"{symbol} error: {e}")
+            update_blacklist(blacklist, symbol, success=False)
             continue
 
     results = sorted(results, key=lambda x: x["score"], reverse=True)[:TOP_N]
-    return results, meta, rows_for_csv
-
-
-def save_csv(rows):
-    if not rows:
-        return None
-
-    df = pd.DataFrame(rows)
-    df.to_csv(CSV_FILE, index=False)
-    return CSV_FILE
-
-
-def telegram_report(results, meta):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = []
-    lines.append("🔥 *BITGET SPOT NARRATIVE SCANNER*")
-    lines.append(f"🕒 {now_str}")
-    lines.append(f"Alpha hits: {len(meta['alpha_hits'])} - Trending hits: {len(meta['trending_hits'])}")
-    lines.append("")
-
-    if not results:
-        lines.append("Tidak ada setup yang lolos filter hari ini.")
-        return "\n".join(lines)
-
-    for i, x in enumerate(results, 1):
-        lines.append(
-            f"{i}. *{x['symbol']}* - {x['label']} - score {x['score']}\n"
-            f" Price: {x['price']}\n"
-            f" Entry: {x['entry']} | SL: {x['stop']}\n"
-            f" TP1: {x['tp1']} | TP2: {x['tp2']} | TP3: {x['tp3']}\n"
-            f" RSI: {x['rsi']} | MACD hist: {x['macd_hist']} | Vol20: {x['vol20']}\n"
-            f" Thesis: {x['reason']}\n"
-        )
-
-    return "\n".join(lines)
-
+    return results, meta, csv_rows
 
 def main():
-    results, meta, csv_rows = run_scan()
-    csv_path = save_csv(csv_rows)
+    try:
+        results, meta, csv_rows = run_scan()
+        csv_path = save_csv(csv_rows)
 
-    report = telegram_report(results, meta)
-    if csv_path:
-        report += f"\n\nCSV saved: `{csv_path}`"
-        log(f"CSV saved to {csv_path}")
+        if csv_path:
+            log(f"CSV saved to {csv_path}")
 
-    safe_telegram_send(report)
-    log(report)
+        if results:
+            report = telegram_report(results, meta)
+            safe_telegram_send(report)
+            log(report)
+        else:
+            log("No valid setup - Telegram not sent.")
 
+    except Exception as e:
+        log_err(f"Fatal error: {e}")
 
 if __name__ == "__main__":
     main()
