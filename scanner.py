@@ -1,19 +1,21 @@
 import os
 import time
+import math
 import hmac
 import base64
 import hashlib
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 
 import requests
 import pandas as pd
 from ta.momentum import RSIIndicator
-from ta.trend import MACD
+from ta.trend import MACD, SMAIndicator
 from ta.volatility import AverageTrueRange
 
-# =========================
+# ============================================================
 # CONFIG
-# =========================
+# ============================================================
 BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
 BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "")
@@ -23,26 +25,50 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 BASE_URL = "https://api.bitget.com"
 
-LIMIT_TOP = 5
 TIMEFRAME = "4H"
-CANDLE_LIMIT = 120
+CANDLE_LIMIT = 180
+TOP_N = 5
 
 MIN_QUOTE_VOLUME_USDT = 500_000
-MIN_LIQUIDITY_USDT = 300_000
-MIN_SCORE = 60
+MIN_AVG_QUOTE_VOLUME_USDT = 300_000
+MIN_SCORE = 62
 
+MAX_SYMBOLS_PER_RUN = 150
+SLEEP_BETWEEN_REQUESTS = 0.15
 REQUEST_TIMEOUT = 20
-SLEEP_BETWEEN_SYMBOLS = 0.2
 
 ALPHA_DAYS_BACK = 2
-ALPHA_NUM_RESULTS = 10
+ALPHA_NUM_RESULTS = 15
 
+# score weights
+W_VOL = 18
+W_TREND = 18
+W_MOMENTUM = 16
+W_MACD = 12
+W_RSI = 10
+W_ATR = 6
+W_NARRATIVE = 12
+W_BREAKOUT = 8
 
-# =========================
-# HELPERS
-# =========================
-def utc_timestamp_ms():
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+def utc_ms():
     return str(int(datetime.now(timezone.utc).timestamp() * 1000))
+
+
+def normalize_text(s):
+    return (
+        str(s)
+        .upper()
+        .replace("$", "")
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace("/", "")
+        .replace(".", "")
+        .strip()
+    )
 
 
 def sign(secret: str, timestamp: str, method: str, path: str, query: str = "", body: str = ""):
@@ -54,8 +80,8 @@ def sign(secret: str, timestamp: str, method: str, path: str, query: str = "", b
     return base64.b64encode(digest).decode()
 
 
-def headers(method: str, path: str, query: str = "", body: str = ""):
-    ts = utc_timestamp_ms()
+def get_headers(method: str, path: str, query: str = "", body: str = ""):
+    ts = utc_ms()
     signature = sign(BITGET_API_SECRET, ts, method, path, query, body)
     return {
         "ACCESS-KEY": BITGET_API_KEY,
@@ -67,21 +93,21 @@ def headers(method: str, path: str, query: str = "", body: str = ""):
     }
 
 
-def get_json(url, params=None, headers_dict=None):
-    r = requests.get(url, params=params or {}, headers=headers_dict or {}, timeout=REQUEST_TIMEOUT)
+def http_get(url, params=None, headers=None):
+    r = requests.get(url, params=params or {}, headers=headers or {}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
-def bitget_public_get(path, params=None):
-    return get_json(BASE_URL + path, params=params)
+def bitget_public(path, params=None):
+    return http_get(BASE_URL + path, params=params)
 
 
-def bitget_private_get(path, params=None):
+def bitget_private(path, params=None):
     query = ""
     if params:
         query = "&".join([f"{k}={v}" for k, v in params.items()])
-    return get_json(BASE_URL + path, params=params or {}, headers_dict=headers("GET", path, query=query))
+    return http_get(BASE_URL + path, params=params or {}, headers=get_headers("GET", path, query=query))
 
 
 def send_telegram(text: str):
@@ -92,7 +118,7 @@ def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for i in range(0, len(text), 3800):
         chunk = text[i:i + 3800]
-        r = requests.post(
+        resp = requests.post(
             url,
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
@@ -102,263 +128,422 @@ def send_telegram(text: str):
             },
             timeout=REQUEST_TIMEOUT,
         )
-        r.raise_for_status()
+        resp.raise_for_status()
 
 
-def normalize_symbol(sym: str) -> str:
-    if not sym:
-        return ""
-    s = str(sym).upper().strip()
-    for suffix in ["_USDT", "-USDT", "/USDT", "USDT"]:
-        if s.endswith(suffix):
-            s = s.replace(suffix, "")
-    return s.replace("/", "").replace("-", "").strip()
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 
-# =========================
-# ALPHA + TRENDING
-# =========================
-def load_alpha_and_trending_symbols():
+def similarity(a, b):
+    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+
+
+# ============================================================
+# NARRATIVE SOURCES
+# ============================================================
+def load_alpha_and_trending_candidates():
     candidates = set()
+    meta = {
+        "alpha_hits": [],
+        "trending_hits": [],
+    }
 
-    # Alpha retrieve
+    # alpha
     try:
         from functions import retrieve_alpha
         alpha = retrieve_alpha(
-            query="crypto listings partnership launch upgrade funding positive catalysts bitget spot",
+            query="crypto listings launch partnership funding upgrade tokenomics positive catalyst",
             days_ago=ALPHA_DAYS_BACK,
             num_results=ALPHA_NUM_RESULTS,
             sentiment="positive",
             event_types=["listing", "launch", "partnership", "funding", "upgrade", "tokenomics"],
-            market_segments=["layer1", "layer2", "defi", "infrastructure", "culture memecoins", "ai agents", "payments wallets"],
+            market_segments=[
+                "layer1", "layer2", "crosschain", "defi", "stablecoins",
+                "infrastructure", "developer tools", "ai agents", "payments wallets",
+                "launchpads airdrops", "culture memecoins", "other"
+            ],
             engagement_levels=["medium", "high"],
         )
 
         for item in alpha.get("results", []):
-            for key in ["ticker", "symbol", "project_name", "name"]:
-                val = item.get(key)
-                if val:
-                    candidates.add(normalize_symbol(val))
+            name = item.get("project_name") or item.get("name") or ""
+            ticker = item.get("ticker") or item.get("symbol") or ""
+            if name:
+                meta["alpha_hits"].append(name)
+                candidates.add(normalize_text(name))
+            if ticker:
+                meta["alpha_hits"].append(ticker)
+                candidates.add(normalize_text(ticker))
     except Exception as e:
         print(f"Alpha error: {e}")
 
-    # Trending coins
+    # trending coins
     try:
         from functions import find_trending_coins
         trending = find_trending_coins()
         coins = trending.get("trending_coins", {}).get("trending_coins", [])
 
         for coin in coins:
-            for key in ["symbol", "name"]:
-                val = coin.get(key)
-                if val:
-                    candidates.add(normalize_symbol(val))
+            sym = coin.get("symbol") or ""
+            name = coin.get("name") or ""
+            if sym:
+                meta["trending_hits"].append(sym)
+                candidates.add(normalize_text(sym))
+            if name:
+                meta["trending_hits"].append(name)
+                candidates.add(normalize_text(name))
     except Exception as e:
         print(f"Trending coins error: {e}")
 
-    # Trending pools from analysis layer if available
-    try:
-        from api_tool import list_resources
-        # no-op placeholder if unavailable in runtime
-    except Exception:
-        pass
-
     candidates.discard("")
-    return candidates
+    return candidates, meta
 
 
-# =========================
-# BITGET SPOT DATA
-# =========================
-def get_bitget_spot_symbols():
-    data = bitget_public_get("/api/v2/spot/public/symbols")
+# ============================================================
+# BITGET SPOT UNIVERSE
+# ============================================================
+def get_bitget_spot_usdt_symbols():
+    data = bitget_public("/api/v2/spot/public/symbols")
     items = data.get("data", [])
-    symbols = []
+    out = []
 
     for x in items:
-        if x.get("quoteCoin") == "USDT" and x.get("status") == "online":
-            symbols.append(x["symbol"])
+        symbol = x.get("symbol")
+        quote = x.get("quoteCoin")
+        status = x.get("status")
+        if symbol and quote == "USDT" and status == "online":
+            out.append(symbol)
 
-    return symbols
+    return sorted(list(set(out)))
 
 
-def get_spot_kline(symbol: str, granularity="4H", limit=120):
+def build_symbol_maps(spot_symbols):
+    norm_map = {}
+    for s in spot_symbols:
+        base = s.replace("_USDT", "")
+        norm_map[normalize_text(base)] = s
+        norm_map[normalize_text(s)] = s
+    return norm_map
+
+
+def match_candidates_to_bitget(candidates, spot_map, spot_symbols):
+    matched = set()
+
+    for cand in candidates:
+        if cand in spot_map:
+            matched.add(spot_map[cand])
+            continue
+
+        # fuzzy match against all Bitget symbols
+        best_sym = None
+        best_score = 0.0
+        for s in spot_symbols:
+            base = s.replace("_USDT", "")
+            score = max(
+                similarity(cand, s),
+                similarity(cand, base),
+            )
+            if score > best_score:
+                best_score = score
+                best_sym = s
+
+        if best_sym and best_score >= 0.72:
+            matched.add(best_sym)
+
+    return sorted(list(matched))
+
+
+# ============================================================
+# MARKET DATA
+# ============================================================
+def get_spot_candles(symbol, granularity="4H", limit=180):
     params = {
         "symbol": symbol,
         "granularity": granularity,
         "limit": str(limit),
     }
-
-    data = bitget_public_get("/api/v2/spot/market/candles", params=params)
+    data = bitget_public("/api/v2/spot/market/candles", params=params)
     rows = data.get("data", [])
-
     if not rows:
         return None
 
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "baseVol", "quoteVol"])
-
-    for col in ["open", "high", "low", "close", "baseVol", "quoteVol"]:
+    for col in ["ts", "open", "high", "low", "close", "baseVol", "quoteVol"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df = df.dropna()
-
     if df.empty:
         return None
 
-    df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
+    df = df.sort_values("ts").reset_index(drop=True)
     return df
 
 
-# =========================
-# ANALYSIS
-# =========================
-def analyze_symbol(symbol: str):
-    df = get_spot_kline(symbol, granularity=TIMEFRAME, limit=CANDLE_LIMIT)
-
-    if df is None or len(df) < 60:
-        return None
-
+# ============================================================
+# TRADE LOGIC
+# ============================================================
+def calc_levels(df):
     close = df["close"]
     high = df["high"]
     low = df["low"]
-
-    rsi = RSIIndicator(close, window=14).rsi().iloc[-1]
-    macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
-    macd_hist = macd.macd_diff().iloc[-1]
-    macd_line = macd.macd().iloc[-1]
-    signal_line = macd.macd_signal().iloc[-1]
-    atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
-
     last = float(close.iloc[-1])
-    prev_20_high = float(high.tail(20).max())
-    prev_20_low = float(low.tail(20).min())
 
-    volume_usdt = float(df["quoteVol"].tail(20).mean())
-    liquidity_proxy = float(df["quoteVol"].tail(60).mean())
+    recent_high_20 = float(high.tail(20).max())
+    recent_low_20 = float(low.tail(20).min())
+    recent_high_50 = float(high.tail(50).max())
+    recent_low_50 = float(low.tail(50).min())
 
-    score = 0
+    atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
+    sma20 = SMAIndicator(close, window=20).sma_indicator().iloc[-1]
+    sma50 = SMAIndicator(close, window=50).sma_indicator().iloc[-1]
 
-    if volume_usdt >= 5_000_000:
-        score += 25
-    elif volume_usdt >= 1_000_000:
-        score += 18
-    elif volume_usdt >= 500_000:
-        score += 10
+    breakout = last > recent_high_20
+    uptrend = sma20 > sma50 if pd.notna(sma20) and pd.notna(sma50) else False
 
-    if liquidity_proxy >= 3_000_000:
-        score += 15
-    elif liquidity_proxy >= 300_000:
-        score += 8
+    # Prefer pullback entry near structure, not chasing spot
+    if breakout:
+        entry = recent_high_20 * 0.995
+    else:
+        fib_618 = recent_low_20 + (recent_high_20 - recent_low_20) * 0.618
+        fib_50 = recent_low_20 + (recent_high_20 - recent_low_20) * 0.5
+        entry = min(fib_50, fib_618, recent_high_20 * 0.995)
 
-    if 45 <= rsi <= 68:
-        score += 15
-    elif rsi < 35:
-        score += 8
+    stop = recent_low_20 * 0.985
+    risk = max(entry - stop, atr * 0.8)
 
-    if macd_hist > 0:
-        score += 15
-
-    if macd_line > signal_line:
-        score += 10
-
-    if last > prev_20_high:
-        score += 10
-    elif last > (prev_20_low + (prev_20_high - prev_20_low) * 0.618):
-        score += 5
-
-    if last > 0 and atr / last > 0.03:
-        score += 5
-
-    entry = round(prev_20_high * 0.995, 8)
-    stop = round(prev_20_low * 0.985, 8)
-    tp1 = round(entry + (entry - stop) * 1.5, 8)
-    tp2 = round(entry + (entry - stop) * 2.5, 8)
-    tp3 = round(entry + (entry - stop) * 3.5, 8)
+    tp1 = entry + risk * 1.5
+    tp2 = entry + risk * 2.5
+    tp3 = entry + risk * 3.5
 
     return {
-        "symbol": symbol,
-        "score": round(score, 1),
-        "price": round(last, 8),
-        "rsi": round(float(rsi), 2),
-        "macd_hist": round(float(macd_hist), 6),
-        "volume_usdt": round(volume_usdt, 2),
-        "liquidity_proxy": round(liquidity_proxy, 2),
-        "entry": entry,
-        "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
+        "last": last,
+        "entry": round(float(entry), 8),
+        "stop": round(float(stop), 8),
+        "tp1": round(float(tp1), 8),
+        "tp2": round(float(tp2), 8),
+        "tp3": round(float(tp3), 8),
+        "atr": float(atr),
+        "sma20": float(sma20) if pd.notna(sma20) else None,
+        "sma50": float(sma50) if pd.notna(sma50) else None,
+        "breakout": breakout,
+        "uptrend": uptrend,
+        "recent_high_20": recent_high_20,
+        "recent_low_20": recent_low_20,
+        "recent_high_50": recent_high_50,
+        "recent_low_50": recent_low_50,
     }
 
 
-# =========================
-# MAIN
-# =========================
-def main():
-    spot_symbols = get_bitget_spot_symbols()
-    spot_map = {normalize_symbol(s): s for s in spot_symbols}
+def score_symbol(df, narrative_hit=False):
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    quote_vol = df["quoteVol"]
 
-    alpha_trending = load_alpha_and_trending_symbols()
+    last = float(close.iloc[-1])
+    vol20 = float(quote_vol.tail(20).mean())
+    vol60 = float(quote_vol.tail(60).mean())
 
-    filtered_symbols = []
-    for k in alpha_trending:
-        if k in spot_map:
-            filtered_symbols.append(spot_map[k])
+    rsi = RSIIndicator(close, window=14).rsi()
+    rsi_last = float(rsi.iloc[-1])
 
-    filtered_symbols = sorted(list(set(filtered_symbols)))
+    macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
+    macd_hist = float(macd.macd_diff().iloc[-1])
+    macd_line = float(macd.macd().iloc[-1])
+    signal_line = float(macd.macd_signal().iloc[-1])
 
-    if not filtered_symbols:
-        send_telegram("Tidak ada simbol alpha/trending yang match dengan Bitget spot USDT.")
-        return
+    sma20 = SMAIndicator(close, window=20).sma_indicator().iloc[-1]
+    sma50 = SMAIndicator(close, window=50).sma_indicator().iloc[-1]
 
-    ranked = []
+    atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
+    atr_pct = float(atr) / last if last > 0 else 0
 
-    for s in filtered_symbols:
+    levels = calc_levels(df)
+
+    score = 0
+
+    # volume
+    if vol20 >= 5_000_000:
+        score += W_VOL
+    elif vol20 >= 1_500_000:
+        score += int(W_VOL * 0.75)
+    elif vol20 >= 500_000:
+        score += int(W_VOL * 0.5)
+
+    # trend
+    if levels["uptrend"]:
+        score += W_TREND
+    elif pd.notna(sma20) and pd.notna(sma50) and sma20 > sma50 * 0.995:
+        score += int(W_TREND * 0.7)
+
+    # momentum / RSI
+    if 45 <= rsi_last <= 68:
+        score += W_RSI
+    elif 35 <= rsi_last < 45:
+        score += int(W_RSI * 0.7)
+    elif rsi_last < 35:
+        score += int(W_RSI * 0.4)
+
+    # MACD
+    if macd_hist > 0:
+        score += W_MACD
+    if macd_line > signal_line:
+        score += 4
+
+    # ATR healthy
+    if 0.025 <= atr_pct <= 0.12:
+        score += W_ATR
+    elif atr_pct > 0.12:
+        score += 3
+
+    # breakout
+    if levels["breakout"]:
+        score += W_BREAKOUT
+
+    # narrative
+    if narrative_hit:
+        score += W_NARRATIVE
+
+    # extra momentum if volume is lifting
+    if vol20 > vol60 * 1.2:
+        score += 4
+
+    return {
+        "score": round(score, 2),
+        "rsi": round(rsi_last, 2),
+        "macd_hist": round(macd_hist, 6),
+        "macd_line": round(macd_line, 6),
+        "signal_line": round(signal_line, 6),
+        "vol20": round(vol20, 2),
+        "vol60": round(vol60, 2),
+        "atr_pct": round(atr_pct, 4),
+        "levels": levels,
+    }
+
+
+def build_reason(item):
+    parts = []
+    if item["levels"]["breakout"]:
+        parts.append("breakout di atas swing high")
+    else:
+        parts.append("entry di area pullback struktur")
+
+    if item["rsi"] >= 45 and item["rsi"] <= 68:
+        parts.append("RSI sehat")
+    if item["macd_hist"] > 0:
+        parts.append("MACD mendukung trend naik")
+    if item["atr_pct"] >= 0.025:
+        parts.append("range masih layak buat follow-through")
+    return " - ".join(parts)
+
+
+def build_signal_label(score):
+    if score >= 75:
+        return "🟢 BUY"
+    elif score >= 62:
+        return "🟡 HOLD"
+    else:
+        return "🔴 SELL"
+
+
+# ============================================================
+# MAIN SCAN
+# ============================================================
+def run_scan():
+    spot_symbols = get_bitget_spot_usdt_symbols()
+    spot_map = build_symbol_maps(spot_symbols)
+
+    candidates, meta = load_alpha_and_trending_candidates()
+    matched = match_candidates_to_bitget(candidates, spot_map, spot_symbols)
+
+    # fallback if alpha/trending misses
+    if not matched:
+        matched = spot_symbols
+
+    matched = matched[:MAX_SYMBOLS_PER_RUN]
+
+    results = []
+    for symbol in matched:
         try:
-            item = analyze_symbol(s)
-            if not item:
+            df = get_spot_candles(symbol, granularity=TIMEFRAME, limit=CANDLE_LIMIT)
+            if df is None or len(df) < 60:
                 continue
 
-            if item["volume_usdt"] < MIN_QUOTE_VOLUME_USDT:
+            narrative_hit = normalize_text(symbol.replace("_USDT", "")) in candidates
+            metrics = score_symbol(df, narrative_hit=narrative_hit)
+            levels = metrics["levels"]
+
+            if metrics["vol20"] < MIN_QUOTE_VOLUME_USDT:
+                continue
+            if metrics["vol60"] < MIN_AVG_QUOTE_VOLUME_USDT:
+                continue
+            if metrics["score"] < MIN_SCORE:
                 continue
 
-            if item["liquidity_proxy"] < MIN_LIQUIDITY_USDT:
-                continue
+            results.append({
+                "symbol": symbol,
+                "score": metrics["score"],
+                "label": build_signal_label(metrics["score"]),
+                "reason": build_reason(metrics),
+                "price": round(float(df["close"].iloc[-1]), 8),
+                "rsi": metrics["rsi"],
+                "macd_hist": metrics["macd_hist"],
+                "vol20": metrics["vol20"],
+                "entry": levels["entry"],
+                "stop": levels["stop"],
+                "tp1": levels["tp1"],
+                "tp2": levels["tp2"],
+                "tp3": levels["tp3"],
+            })
 
-            if item["score"] < MIN_SCORE:
-                continue
-
-            ranked.append(item)
-            time.sleep(SLEEP_BETWEEN_SYMBOLS)
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
 
         except Exception as e:
-            print(f"Error on {s}: {e}")
+            print(f"{symbol} error: {e}")
             continue
 
-    ranked = sorted(ranked, key=lambda x: x["score"], reverse=True)[:LIMIT_TOP]
+    results = sorted(results, key=lambda x: x["score"], reverse=True)[:TOP_N]
+    return results, meta
 
-    if not ranked:
-        send_telegram("Tidak ada setup spot Bitget yang lolos filter hari ini.")
-        return
 
+def telegram_report(results, meta):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     lines = []
-    lines.append("🔥 *BITGET SPOT SCAN*")
+    lines.append("🔥 *BITGET SPOT NARRATIVE SCANNER*")
     lines.append(f"🕒 {now_str}")
     lines.append("")
-    lines.append("*Top setup:*")
+    lines.append(f"Alpha hits: {len(meta['alpha_hits'])} - Trending hits: {len(meta['trending_hits'])}")
+    lines.append("")
 
-    for i, x in enumerate(ranked, 1):
+    if not results:
+        lines.append("Tidak ada setup yang lolos filter hari ini.")
+        lines.append("Coba longgarkan MIN_SCORE atau turunkan minimum volume.")
+        return "\n".join(lines)
+
+    for i, x in enumerate(results, 1):
         lines.append(
-            f"{i}. *{x['symbol']}* - score {x['score']}\n"
-            f" Entry {x['entry']} | SL {x['stop']} | TP1 {x['tp1']} | TP2 {x['tp2']} | TP3 {x['tp3']}\n"
-            f" Price {x['price']} | RSI {x['rsi']} | MACD hist {x['macd_hist']} | Vol {x['volume_usdt']}"
+            f"{i}. *{x['symbol']}* - {x['label']} - score {x['score']}\n"
+            f" Price: {x['price']}\n"
+            f" Entry: {x['entry']} | SL: {x['stop']}\n"
+            f" TP1: {x['tp1']} | TP2: {x['tp2']} | TP3: {x['tp3']}\n"
+            f" RSI: {x['rsi']} | MACD hist: {x['macd_hist']} | Vol20: {x['vol20']}\n"
+            f" Thesis: {x['reason']}\n"
         )
 
-    send_telegram("\n".join(lines))
+    return "\n".join(lines)
+
+
+def main():
+    results, meta = run_scan()
+    report = telegram_report(results, meta)
+    send_telegram(report)
+    print(report)
 
 
 if __name__ == "__main__":
     main()
-                              
+                     
