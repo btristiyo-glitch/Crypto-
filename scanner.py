@@ -14,12 +14,12 @@ from ta.volatility import AverageTrueRange
 # =========================
 # CONFIG
 # =========================
-BITGET_API_KEY = os.getenv("BITGET_API_KEY")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
-BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
+BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
+BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 BASE_URL = "https://api.bitget.com"
 
@@ -34,9 +34,12 @@ MIN_SCORE = 60
 REQUEST_TIMEOUT = 20
 SLEEP_BETWEEN_SYMBOLS = 0.2
 
+ALPHA_DAYS_BACK = 2
+ALPHA_NUM_RESULTS = 10
+
 
 # =========================
-# UTILS
+# HELPERS
 # =========================
 def utc_timestamp_ms():
     return str(int(datetime.now(timezone.utc).timestamp() * 1000))
@@ -53,39 +56,32 @@ def sign(secret: str, timestamp: str, method: str, path: str, query: str = "", b
 
 def headers(method: str, path: str, query: str = "", body: str = ""):
     ts = utc_timestamp_ms()
-    signature = sign(BITGET_API_SECRET or "", ts, method, path, query, body)
-
+    signature = sign(BITGET_API_SECRET, ts, method, path, query, body)
     return {
-        "ACCESS-KEY": BITGET_API_KEY or "",
+        "ACCESS-KEY": BITGET_API_KEY,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": ts,
-        "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE or "",
+        "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
         "Content-Type": "application/json",
         "locale": "en-US",
     }
 
 
+def get_json(url, params=None, headers_dict=None):
+    r = requests.get(url, params=params or {}, headers=headers_dict or {}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
 def bitget_public_get(path, params=None):
-    url = BASE_URL + path
-    response = requests.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    return response.json()
+    return get_json(BASE_URL + path, params=params)
 
 
 def bitget_private_get(path, params=None):
     query = ""
     if params:
         query = "&".join([f"{k}={v}" for k, v in params.items()])
-
-    url = BASE_URL + path
-    response = requests.get(
-        url,
-        params=params or {},
-        headers=headers("GET", path, query=query),
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    return response.json()
+    return get_json(BASE_URL + path, params=params or {}, headers_dict=headers("GET", path, query=query))
 
 
 def send_telegram(text: str):
@@ -94,7 +90,6 @@ def send_telegram(text: str):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     for i in range(0, len(text), 3800):
         chunk = text[i:i + 3800]
         r = requests.post(
@@ -108,6 +103,68 @@ def send_telegram(text: str):
             timeout=REQUEST_TIMEOUT,
         )
         r.raise_for_status()
+
+
+def normalize_symbol(sym: str) -> str:
+    if not sym:
+        return ""
+    s = str(sym).upper().strip()
+    for suffix in ["_USDT", "-USDT", "/USDT", "USDT"]:
+        if s.endswith(suffix):
+            s = s.replace(suffix, "")
+    return s.replace("/", "").replace("-", "").strip()
+
+
+# =========================
+# ALPHA + TRENDING
+# =========================
+def load_alpha_and_trending_symbols():
+    candidates = set()
+
+    # Alpha retrieve
+    try:
+        from functions import retrieve_alpha
+        alpha = retrieve_alpha(
+            query="crypto listings partnership launch upgrade funding positive catalysts bitget spot",
+            days_ago=ALPHA_DAYS_BACK,
+            num_results=ALPHA_NUM_RESULTS,
+            sentiment="positive",
+            event_types=["listing", "launch", "partnership", "funding", "upgrade", "tokenomics"],
+            market_segments=["layer1", "layer2", "defi", "infrastructure", "culture memecoins", "ai agents", "payments wallets"],
+            engagement_levels=["medium", "high"],
+        )
+
+        for item in alpha.get("results", []):
+            for key in ["ticker", "symbol", "project_name", "name"]:
+                val = item.get(key)
+                if val:
+                    candidates.add(normalize_symbol(val))
+    except Exception as e:
+        print(f"Alpha error: {e}")
+
+    # Trending coins
+    try:
+        from functions import find_trending_coins
+        trending = find_trending_coins()
+        coins = trending.get("trending_coins", {}).get("trending_coins", [])
+
+        for coin in coins:
+            for key in ["symbol", "name"]:
+                val = coin.get(key)
+                if val:
+                    candidates.add(normalize_symbol(val))
+    except Exception as e:
+        print(f"Trending coins error: {e}")
+
+    # Trending pools from analysis layer if available
+    try:
+        from api_tool import list_resources
+        # no-op placeholder if unavailable in runtime
+    except Exception:
+        pass
+
+    candidates.discard("")
+    return candidates
 
 
 # =========================
@@ -238,10 +295,25 @@ def analyze_symbol(symbol: str):
 # MAIN
 # =========================
 def main():
-    ranked = []
-    symbols = get_bitget_spot_symbols()
+    spot_symbols = get_bitget_spot_symbols()
+    spot_map = {normalize_symbol(s): s for s in spot_symbols}
 
-    for s in symbols:
+    alpha_trending = load_alpha_and_trending_symbols()
+
+    filtered_symbols = []
+    for k in alpha_trending:
+        if k in spot_map:
+            filtered_symbols.append(spot_map[k])
+
+    filtered_symbols = sorted(list(set(filtered_symbols)))
+
+    if not filtered_symbols:
+        send_telegram("Tidak ada simbol alpha/trending yang match dengan Bitget spot USDT.")
+        return
+
+    ranked = []
+
+    for s in filtered_symbols:
         try:
             item = analyze_symbol(s)
             if not item:
@@ -289,4 +361,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+                              
