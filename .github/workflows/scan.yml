@@ -2,7 +2,7 @@ name: Bitget Spot Scanner
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/20 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -37,8 +37,15 @@ jobs:
         run: |
           python scanner.py
 
+      - name: Check files
+        run: |
+          ls -lah output || true
+          test -f output/scan_results.csv || echo "CSV not found"
+          test -f output/scanner.log || echo "LOG not found"
+
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: bitget-scan-results
           path: output/scan_results.csv
@@ -47,6 +54,7 @@ jobs:
 
       - name: Upload log artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: bitget-scan-log
           path: output/scanner.log
