@@ -8,14 +8,8 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: write
 
     env:
-      BITGET_API_KEY: ${{ secrets.BITGET_API_KEY }}
-      BITGET_API_SECRET: ${{ secrets.BITGET_API_SECRET }}
-      BITGET_API_PASSPHRASE: ${{ secrets.BITGET_API_PASSPHRASE }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
