@@ -19,26 +19,29 @@ BASE_URL = "https://api.bitget.com"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TIMEFRAMES = ["15m", "1H", "4H"]
+# Bitget candle intervals - valid format
+TIMEFRAMES = {
+    "15m": "15min",
+    "1H": "1h",
+    "4H": "4h",
+}
+
 CANDLE_LIMITS = {"15m": 240, "1H": 220, "4H": 180}
 
 TOP_N = 5
-MAX_SYMBOLS_PER_RUN = 140
+MAX_SYMBOLS_PER_RUN = 120
 
 MIN_QUOTE_VOLUME_USDT = 120_000
 
-# scoring
 MIN_SCORE = 58
 EARLY_SCORE = 46
 
-# edge filters
 ADX_MIN = 25
 ATR_EXPANSION_MIN = 1.15
 ATR_PCT_MIN = 0.015
 MAX_DIST_FROM_EMA20_PCT = 2.0
 MACD_ALIGN_MIN = 2
 
-# safety
 SLEEP_BETWEEN_REQUESTS = 0.12
 REQUEST_TIMEOUT = 20
 
@@ -100,12 +103,13 @@ def bitget_public(path, params=None):
 
 def safe_telegram_send(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram disabled - token/chat_id not set.")
+        log("Telegram disabled - TELEGRAM_TOKEN or TELEGRAM_CHAT_ID missing.")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)]
+        ok = True
         for chunk in chunks:
             resp = requests.post(
                 url,
@@ -119,8 +123,8 @@ def safe_telegram_send(text: str):
             )
             if resp.status_code != 200:
                 log_err(f"Telegram error: {resp.status_code} - {resp.text}")
-                return False
-        return True
+                ok = False
+        return ok
     except Exception as e:
         log_err(f"Telegram exception: {e}")
         return False
@@ -191,7 +195,7 @@ def load_alpha_and_trending_candidates():
 
     try:
         from functions import find_trending_liquidity_pools
-        pools = find_trending_liquidity_pools(duration="6h")
+        pools = find_trending_liquidity_pools(duration="24h")
         for item in pools.get("pools", []):
             token = item.get("base_token_symbol", "")
             if token:
@@ -263,21 +267,40 @@ def match_candidates_to_bitget(candidates, spot_map, spot_symbols):
 # ============================================================
 # DATA
 # ============================================================
-def get_spot_candles(symbol, granularity="4H", limit=180):
-    for g in [granularity, "1H", "15m"]:
+def get_spot_candles(symbol, interval="4h", limit=180):
+    endpoints = [
+        "/api/v2/spot/market/history-candles",
+        "/api/v2/spot/market/candles",
+    ]
+
+    for path in endpoints:
         try:
-            params = {"symbol": symbol, "granularity": g, "limit": str(limit)}
-            data = bitget_public("/api/v2/spot/market/candles", params=params)
+            params = {
+                "symbol": symbol,
+                "granularity": interval,
+                "limit": str(limit),
+            }
+            data = bitget_public(path, params=params)
             rows = data.get("data", [])
             if rows:
-                df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "baseVol", "quoteVol"])
+                df = pd.DataFrame(rows)
+
+                if df.shape[1] >= 7:
+                    df = df.iloc[:, :7]
+                    df.columns = ["ts", "open", "high", "low", "close", "baseVol", "quoteVol"]
+                else:
+                    continue
+
                 for col in ["ts", "open", "high", "low", "close", "baseVol", "quoteVol"]:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
+
                 df = df.dropna()
-                if not df.empty:
+                if len(df) >= 60:
                     return df.sort_values("ts").reset_index(drop=True)
+
         except Exception as e:
-            log_err(f"{symbol} candles failed on {g}: {e}")
+            log_err(f"{symbol} candles failed on {path} {interval}: {e}")
+
     return None
 
 # ============================================================
@@ -314,9 +337,6 @@ def compute_volatility_expansion(df, atr_len=14, lookback=50):
         return 0.0
     return float(atr_s.iloc[-1] / avg_hist.iloc[-1])
 
-# ============================================================
-# SCORING
-# ============================================================
 def compute_tf_metrics(df):
     close = df["close"]
     high = df["high"]
@@ -347,12 +367,8 @@ def compute_tf_metrics(df):
 
     return {
         "last": last,
-        "sma20": float(sma20) if pd.notna(sma20) else None,
-        "sma50": float(sma50) if pd.notna(sma50) else None,
         "rsi": float(rsi),
         "macd_hist": float(macd.macd_diff().iloc[-1]),
-        "macd_line": float(macd.macd().iloc[-1]),
-        "macd_signal": float(macd.macd_signal().iloc[-1]),
         "atr_pct": float(atr) / last if last > 0 else 0,
         "adx": float(adx_val) if pd.notna(adx_val) else 0,
         "atr_expansion": float(atr_expansion),
@@ -538,7 +554,6 @@ def build_levels_from_4h(df):
         "tp1": round(float(entry + risk * 1.4), 8),
         "tp2": round(float(entry + risk * 2.2), 8),
         "tp3": round(float(entry + risk * 3.2), 8),
-        "risk": risk,
     }
 
 def rank_potential(score, metrics_by_tf, narrative_hit, fdv_score, buy_surge_score, vol_accel_score):
@@ -667,10 +682,17 @@ def telegram_report(results, meta):
             f"TP1: {x['tp1']} | TP2: {x['tp2']} | TP3: {x['tp3']}\n"
             f"15m RSI {x['rsi_15m']} | 1H RSI {x['rsi_1h']} | 4H RSI {x['rsi_4h']}\n"
             f"ADX: {x['adx_15m']} / {x['adx_1h']} / {x['adx_4h']}\n"
-            f"ATR exp: {x['atr_exp_15m']} / {x['atr_exp_1h']}\n"
             f"Reason: {x['reason_for_rank']}\n"
         )
     return "\n".join(lines)
+
+def telegram_status_message(status, extra=""):
+    return (
+        "✅ *SCANNER STATUS*\n"
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Status: {status}\n"
+        f"{extra}".strip()
+    )
 
 # ============================================================
 # MAIN
@@ -697,8 +719,8 @@ def run_scan():
             metrics_by_tf = {}
             dfs = {}
 
-            for tf in TIMEFRAMES:
-                df = get_spot_candles(symbol, granularity=tf, limit=CANDLE_LIMITS[tf])
+            for tf in ["15m", "1H", "4H"]:
+                df = get_spot_candles(symbol, interval=TIMEFRAMES[tf], limit=CANDLE_LIMITS[tf])
                 if df is None or len(df) < 60:
                     raise ValueError(f"not enough candles for {tf}")
                 dfs[tf] = df
@@ -723,7 +745,7 @@ def run_scan():
 
             try:
                 from functions import find_trending_liquidity_pools
-                pools = find_trending_liquidity_pools(duration="6h")
+                pools = find_trending_liquidity_pools(duration="24h")
                 for item in pools.get("pools", []):
                     token = normalize_text(item.get("base_token_symbol", ""))
                     if token and token == base_symbol:
@@ -787,18 +809,12 @@ def run_scan():
                 "rsi_15m": metrics_by_tf["15m"]["rsi"],
                 "rsi_1h": metrics_by_tf["1H"]["rsi"],
                 "rsi_4h": metrics_by_tf["4H"]["rsi"],
-                "macd_15m": metrics_by_tf["15m"]["macd_hist"],
-                "macd_1h": metrics_by_tf["1H"]["macd_hist"],
-                "macd_4h": metrics_by_tf["4H"]["macd_hist"],
                 "adx_15m": metrics_by_tf["15m"]["adx"],
                 "adx_1h": metrics_by_tf["1H"]["adx"],
                 "adx_4h": metrics_by_tf["4H"]["adx"],
                 "atr_exp_15m": round(metrics_by_tf["15m"]["atr_expansion"], 2),
                 "atr_exp_1h": round(metrics_by_tf["1H"]["atr_expansion"], 2),
                 "dist_ema20_15m": round(metrics_by_tf["15m"]["dist_from_ema20"], 2),
-                "vol20_15m": metrics_by_tf["15m"]["vol20"],
-                "vol20_1h": metrics_by_tf["1H"]["vol20"],
-                "vol20_4h": metrics_by_tf["4H"]["vol20"],
                 "breakout_15m": metrics_by_tf["15m"]["breakout"],
                 "breakout_1h": metrics_by_tf["1H"]["breakout"],
                 "breakout_4h": metrics_by_tf["4H"]["breakout"],
@@ -832,10 +848,16 @@ def main():
             report = telegram_report(results, meta)
             safe_telegram_send(report)
             log(report)
+            # kirim notifikasi sukses walau isi singkat
+            safe_telegram_send(telegram_status_message("RUN SUCCESS", f"Top signal: {results[0]['symbol']}"))
         else:
-            log("No valid setup - Telegram not sent.")
+            msg = telegram_status_message("RUN FINISHED - NO VALID SETUP")
+            safe_telegram_send(msg)
+            log("No valid setup - Telegram status sent.")
     except Exception as e:
-        log_err(f"Fatal error: {e}")
+        err = f"Fatal error: {e}"
+        log_err(err)
+        safe_telegram_send(telegram_status_message("FATAL ERROR", err))
 
 if __name__ == "__main__":
     main()
