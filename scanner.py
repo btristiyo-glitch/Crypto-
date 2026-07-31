@@ -1,14 +1,12 @@
 import os
 import time
-import hmac
-import base64
-import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from difflib import SequenceMatcher
 
 import requests
 import pandas as pd
+import numpy as np
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
 from ta.volatility import AverageTrueRange
@@ -28,9 +26,19 @@ TOP_N = 5
 MAX_SYMBOLS_PER_RUN = 140
 
 MIN_QUOTE_VOLUME_USDT = 120_000
+
+# main filters
 MIN_SCORE = 58
 EARLY_SCORE = 46
 
+# edge filters
+ADX_MIN = 25
+ATR_EXPANSION_MIN = 1.15
+ATR_PCT_MIN = 0.015
+MAX_DIST_FROM_EMA20_PCT = 2.0
+MACD_ALIGN_MIN = 2
+
+# extra safety
 SLEEP_BETWEEN_REQUESTS = 0.12
 REQUEST_TIMEOUT = 20
 
@@ -94,21 +102,24 @@ def safe_telegram_send(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram disabled - token/chat_id not set.")
         return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        resp = requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text[:3900],
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            log_err(f"Telegram error: {resp.status_code} - {resp.text}")
-            return False
+        chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)]
+        for chunk in chunks:
+            resp = requests.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": chunk,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                log_err(f"Telegram error: {resp.status_code} - {resp.text}")
+                return False
         return True
     except Exception as e:
         log_err(f"Telegram exception: {e}")
@@ -138,8 +149,10 @@ def update_blacklist(blacklist, symbol, success):
         blacklist[key] = max(0, blacklist.get(key, 0) - 1)
     else:
         blacklist[key] = blacklist.get(key, 0) + 1
+
     if blacklist.get(key, 0) <= 0:
         blacklist.pop(key, None)
+
     save_blacklist(blacklist)
 
 def is_blacklisted(blacklist, symbol):
@@ -160,7 +173,11 @@ def load_alpha_and_trending_candidates():
             num_results=ALPHA_NUM_RESULTS,
             sentiment="positive",
             event_types=["listing", "launch", "partnership", "funding", "upgrade", "tokenomics"],
-            market_segments=["layer1", "layer2", "crosschain", "defi", "stablecoins", "infrastructure", "developer tools", "ai agents", "payments wallets", "launchpads airdrops", "culture memecoins", "other"],
+            market_segments=[
+                "layer1", "layer2", "crosschain", "defi", "stablecoins",
+                "infrastructure", "developer tools", "ai agents",
+                "payments wallets", "launchpads airdrops", "culture memecoins", "other"
+            ],
             engagement_levels=["medium", "high"],
         )
         for item in alpha.get("results", []):
@@ -228,6 +245,7 @@ def match_candidates_to_bitget(candidates, spot_map, spot_symbols):
         if cand in spot_map:
             matched.add(spot_map[cand])
             continue
+
         best_sym = None
         best_score = 0.0
         for s in spot_symbols:
@@ -236,8 +254,10 @@ def match_candidates_to_bitget(candidates, spot_map, spot_symbols):
             if sc > best_score:
                 best_score = sc
                 best_sym = s
+
         if best_sym and best_score >= 0.72:
             matched.add(best_sym)
+
     return sorted(list(matched))
 
 # ============================================================
@@ -259,6 +279,40 @@ def get_spot_candles(symbol, granularity="4H", limit=180):
         except Exception as e:
             log_err(f"{symbol} candles failed on {g}: {e}")
     return None
+
+# ============================================================
+# INDICATORS
+# ============================================================
+def compute_adx(df, window=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    up = high.diff()
+    down = -low.diff()
+
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr_s = tr.rolling(window).mean()
+
+    plus_di = 100 * (plus_dm.rolling(window).mean() / atr_s.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.rolling(window).mean() / atr_s.replace(0, np.nan))
+
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+    return dx.rolling(window).mean()
+
+def compute_volatility_expansion(df, atr_len=14, lookback=50):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr_s = tr.rolling(atr_len).mean()
+    avg_hist = atr_s.shift(1).rolling(lookback).mean()
+    if pd.isna(avg_hist.iloc[-1]) or avg_hist.iloc[-1] == 0:
+        return 0.0
+    return float(atr_s.iloc[-1] / avg_hist.iloc[-1])
 
 # ============================================================
 # SCORING
@@ -285,6 +339,12 @@ def compute_tf_metrics(df):
     cross_count = ((close.tail(20) > sma20) != (close.tail(20).shift(1) > sma20)).sum() if pd.notna(sma20) else 0
     sma_gap = abs(float(sma20) - float(sma50)) / last if pd.notna(sma20) and pd.notna(sma50) and last > 0 else 0
 
+    adx_val = compute_adx(df, ADX_MIN).iloc[-1]
+    atr_expansion = compute_volatility_expansion(df, atr_len=14, lookback=50)
+
+    ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+    dist_from_ema20 = ((last - float(ema20)) / float(ema20) * 100) if ema20 and pd.notna(ema20) else 0
+
     return {
         "last": last,
         "sma20": float(sma20) if pd.notna(sma20) else None,
@@ -294,6 +354,9 @@ def compute_tf_metrics(df):
         "macd_line": float(macd.macd().iloc[-1]),
         "macd_signal": float(macd.macd_signal().iloc[-1]),
         "atr_pct": float(atr) / last if last > 0 else 0,
+        "adx": float(adx_val) if pd.notna(adx_val) else 0,
+        "atr_expansion": float(atr_expansion),
+        "dist_from_ema20": float(dist_from_ema20),
         "vol20": vol20,
         "vol60": vol60,
         "breakout": breakout,
@@ -311,6 +374,7 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
     score = 0
     notes = []
 
+    # volume
     if m15["vol20"] >= 250_000:
         score += 10
     elif m15["vol20"] >= 80_000:
@@ -326,13 +390,15 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
     elif m4h["vol20"] >= 200_000:
         score += 5
 
-    if m15["rsi"] >= 45 and m15["rsi"] <= 74:
+    # RSI
+    if 45 <= m15["rsi"] <= 74:
         score += 5
-    if m1h["rsi"] >= 42 and m1h["rsi"] <= 72:
+    if 42 <= m1h["rsi"] <= 72:
         score += 6
-    if m4h["rsi"] >= 40 and m4h["rsi"] <= 68:
+    if 40 <= m4h["rsi"] <= 68:
         score += 7
 
+    # MACD
     if m15["macd_hist"] > 0:
         score += 4
     if m1h["macd_hist"] > 0:
@@ -340,6 +406,7 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
     if m4h["macd_hist"] > 0:
         score += 7
 
+    # breakout
     if m15["breakout"]:
         score += 6
         notes.append("15m breakout")
@@ -350,6 +417,7 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
         score += 10
         notes.append("4H breakout")
 
+    # chop penalty
     if m15["cross_count"] >= 6 and m15["sma_gap"] < 0.01:
         score -= 8
         notes.append("15m chop")
@@ -360,6 +428,7 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
         score -= 12
         notes.append("4H chop")
 
+    # atr %
     if m15["atr_pct"] >= 0.02:
         score += 3
     if m1h["atr_pct"] >= 0.02:
@@ -367,6 +436,7 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
     if m4h["atr_pct"] >= 0.02:
         score += 3
 
+    # volume acceleration
     if m15["vol20"] > m15["vol60"] * 1.15:
         score += 4
         notes.append("15m volume acceleration")
@@ -377,18 +447,77 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
         score += 4
         notes.append("4H volume acceleration")
 
+    # edge filters
+    adx_ok = 0
+    for tf_name, m in (("15m", m15), ("1H", m1h), ("4H", m4h)):
+        if m["adx"] >= ADX_MIN:
+            score += 5
+            adx_ok += 1
+            notes.append(f"{tf_name} ADX strong")
+        elif m["adx"] < 22:
+            score -= 10
+            notes.append(f"{tf_name} ADX weak/chop")
+
+    if adx_ok >= 2:
+        score += 4
+
+    exp_ok = 0
+    for tf_name, m in (("15m", m15), ("1H", m1h), ("4H", m4h)):
+        if m["atr_expansion"] >= ATR_EXPANSION_MIN:
+            score += 3
+            exp_ok += 1
+            notes.append(f"{tf_name} vol expanding")
+    if exp_ok >= 2:
+        score += 3
+
+    if m15["atr_pct"] < ATR_PCT_MIN:
+        score -= 12
+        notes.append("15m ATR too small")
+    elif m15["atr_pct"] >= 0.02:
+        score += 2
+
+    if m15["dist_from_ema20"] > MAX_DIST_FROM_EMA20_PCT and m4h["macd_hist"] <= 0:
+        score -= 12
+        notes.append("too far from EMA20")
+
     if narrative_hit:
         score += 10
         notes.append("narrative hit")
 
     alignment = int((m15["macd_hist"] > 0) + (m1h["macd_hist"] > 0) + (m4h["macd_hist"] > 0))
-    if alignment == 3:
+    if alignment >= 3:
         score += 8
         notes.append("3 TF aligned")
     elif alignment == 2:
         score += 4
+    else:
+        score -= 8
+        notes.append("MACD disalign")
 
     return round(score, 2), notes
+
+def apply_precision_filter(metrics_by_tf):
+    m15, m1h, m4h = metrics_by_tf["15m"], metrics_by_tf["1H"], metrics_by_tf["4H"]
+
+    weak_adx = sum(1 for m in (m15, m1h, m4h) if m["adx"] < 22)
+    if weak_adx >= 2:
+        return False, "chop (>=2 TF ADX<22)"
+
+    exp_ok = sum(1 for m in (m15, m1h, m4h) if m["atr_expansion"] >= ATR_EXPANSION_MIN)
+    if exp_ok == 0:
+        return False, "volatility not expanding"
+
+    if m15["dist_from_ema20"] > MAX_DIST_FROM_EMA20_PCT and m4h["macd_hist"] <= 0:
+        return False, f"too far from EMA20 ({m15['dist_from_ema20']:.1f}%)"
+
+    align = int((m15["macd_hist"] > 0) + (m1h["macd_hist"] > 0) + (m4h["macd_hist"] > 0))
+    if align < MACD_ALIGN_MIN:
+        return False, f"MACD disalign ({align} TF)"
+
+    if m15["atr_pct"] < ATR_PCT_MIN:
+        return False, "ATR too small"
+
+    return True, ""
 
 def build_levels_from_4h(df):
     close = df["close"]
@@ -534,6 +663,7 @@ def telegram_report(results, meta):
         f"Alpha hits: {len(meta['alpha_hits'])} - Trending hits: {len(meta['trending_hits'])} - New listings: {len(meta['new_listing_hits'])}",
         "",
     ]
+
     if not results:
         lines.append("Tidak ada setup valid hari ini.")
         return "\n".join(lines)
@@ -544,7 +674,8 @@ def telegram_report(results, meta):
             f"Entry: {x['entry']} | SL: {x['stop']}\n"
             f"TP1: {x['tp1']} | TP2: {x['tp2']} | TP3: {x['tp3']}\n"
             f"15m RSI {x['rsi_15m']} | 1H RSI {x['rsi_1h']} | 4H RSI {x['rsi_4h']}\n"
-            f"FDV score: {x['fdv_score']} | Buy surge: {x['buy_surge_score']} | Vol accel: {x['vol_accel_score']}\n"
+            f"ADX: {x['adx_15m']} / {x['adx_1h']} / {x['adx_4h']}\n"
+            f"ATR exp: {x['atr_exp_15m']} / {x['atr_exp_1h']}\n"
             f"Reason: {x['reason_for_rank']}\n"
         )
     return "\n".join(lines)
@@ -573,6 +704,7 @@ def run_scan():
         try:
             metrics_by_tf = {}
             dfs = {}
+
             for tf in TIMEFRAMES:
                 df = get_spot_candles(symbol, granularity=tf, limit=CANDLE_LIMITS[tf])
                 if df is None or len(df) < 60:
@@ -584,6 +716,13 @@ def run_scan():
             narrative_hit = base_symbol in candidates
 
             score, notes = score_trend_and_flow(metrics_by_tf, narrative_hit=narrative_hit)
+
+            ok_gate, gate_msg = apply_precision_filter(metrics_by_tf)
+            allow_early_grace = narrative_hit or metrics_by_tf["15m"]["breakout"] or metrics_by_tf["1H"]["breakout"]
+            if not ok_gate and not allow_early_grace:
+                update_blacklist(blacklist, symbol, False)
+                log(f"  SKIP {symbol} -> {gate_msg}")
+                continue
 
             fdv_score = 0
             buy_surge_score = 0
@@ -619,8 +758,10 @@ def run_scan():
             score += fdv_score + buy_surge_score + vol_accel_score
             rank = rank_potential(score, metrics_by_tf, narrative_hit, fdv_score, buy_surge_score, vol_accel_score)
 
-            early = score >= EARLY_SCORE and score < MIN_SCORE and (
-                narrative_hit or metrics_by_tf["15m"]["breakout"] or metrics_by_tf["1H"]["breakout"]
+            early = (
+                score >= EARLY_SCORE
+                and score < MIN_SCORE
+                and (narrative_hit or metrics_by_tf["15m"]["breakout"] or metrics_by_tf["1H"]["breakout"])
             )
 
             if score < MIN_SCORE and not early:
@@ -657,6 +798,12 @@ def run_scan():
                 "macd_15m": metrics_by_tf["15m"]["macd_hist"],
                 "macd_1h": metrics_by_tf["1H"]["macd_hist"],
                 "macd_4h": metrics_by_tf["4H"]["macd_hist"],
+                "adx_15m": metrics_by_tf["15m"]["adx"],
+                "adx_1h": metrics_by_tf["1H"]["adx"],
+                "adx_4h": metrics_by_tf["4H"]["adx"],
+                "atr_exp_15m": round(metrics_by_tf["15m"]["atr_expansion"], 2),
+                "atr_exp_1h": round(metrics_by_tf["1H"]["atr_expansion"], 2),
+                "dist_ema20_15m": round(metrics_by_tf["15m"]["dist_from_ema20"], 2),
                 "vol20_15m": metrics_by_tf["15m"]["vol20"],
                 "vol20_1h": metrics_by_tf["1H"]["vol20"],
                 "vol20_4h": metrics_by_tf["4H"]["vol20"],
