@@ -27,7 +27,7 @@ MAX_SYMBOLS_PER_RUN = 140
 
 MIN_QUOTE_VOLUME_USDT = 120_000
 
-# main filters
+# scoring
 MIN_SCORE = 58
 EARLY_SCORE = 46
 
@@ -38,7 +38,7 @@ ATR_PCT_MIN = 0.015
 MAX_DIST_FROM_EMA20_PCT = 2.0
 MACD_ALIGN_MIN = 2
 
-# extra safety
+# safety
 SLEEP_BETWEEN_REQUESTS = 0.12
 REQUEST_TIMEOUT = 20
 
@@ -339,7 +339,7 @@ def compute_tf_metrics(df):
     cross_count = ((close.tail(20) > sma20) != (close.tail(20).shift(1) > sma20)).sum() if pd.notna(sma20) else 0
     sma_gap = abs(float(sma20) - float(sma50)) / last if pd.notna(sma20) and pd.notna(sma50) and last > 0 else 0
 
-    adx_val = compute_adx(df, ADX_MIN).iloc[-1]
+    adx_val = compute_adx(df, 14).iloc[-1]
     atr_expansion = compute_volatility_expansion(df, atr_len=14, lookback=50)
 
     ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
@@ -374,7 +374,6 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
     score = 0
     notes = []
 
-    # volume
     if m15["vol20"] >= 250_000:
         score += 10
     elif m15["vol20"] >= 80_000:
@@ -390,7 +389,6 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
     elif m4h["vol20"] >= 200_000:
         score += 5
 
-    # RSI
     if 45 <= m15["rsi"] <= 74:
         score += 5
     if 42 <= m1h["rsi"] <= 72:
@@ -398,7 +396,6 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
     if 40 <= m4h["rsi"] <= 68:
         score += 7
 
-    # MACD
     if m15["macd_hist"] > 0:
         score += 4
     if m1h["macd_hist"] > 0:
@@ -406,7 +403,6 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
     if m4h["macd_hist"] > 0:
         score += 7
 
-    # breakout
     if m15["breakout"]:
         score += 6
         notes.append("15m breakout")
@@ -417,7 +413,6 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
         score += 10
         notes.append("4H breakout")
 
-    # chop penalty
     if m15["cross_count"] >= 6 and m15["sma_gap"] < 0.01:
         score -= 8
         notes.append("15m chop")
@@ -428,7 +423,6 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
         score -= 12
         notes.append("4H chop")
 
-    # atr %
     if m15["atr_pct"] >= 0.02:
         score += 3
     if m1h["atr_pct"] >= 0.02:
@@ -436,7 +430,6 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
     if m4h["atr_pct"] >= 0.02:
         score += 3
 
-    # volume acceleration
     if m15["vol20"] > m15["vol60"] * 1.15:
         score += 4
         notes.append("15m volume acceleration")
@@ -447,7 +440,6 @@ def score_trend_and_flow(metrics_by_tf, narrative_hit=False):
         score += 4
         notes.append("4H volume acceleration")
 
-    # edge filters
     adx_ok = 0
     for tf_name, m in (("15m", m15), ("1H", m1h), ("4H", m4h)):
         if m["adx"] >= ADX_MIN:
